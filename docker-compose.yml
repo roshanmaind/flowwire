@@ -1,0 +1,107 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# n8n Business Automation — Local Stack
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage:
+#   cp .env.example .env     # add your credentials
+#   docker compose up -d
+#
+# Services:
+#   n8n       → http://localhost:5678   (workflow engine)
+#   postgres  → localhost:5433          (internal DB)
+#   pgadmin   → http://localhost:5050   (optional DB GUI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: n8n_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-n8n}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-n8n_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d  # seed scripts (optional)
+    ports:
+      - "5433:5432"   # expose on 5433 to avoid clashing with a local PG
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-n8n}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── n8n ─────────────────────────────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n_engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # --- Auth ---
+      N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE:-true}
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:-changeme}
+
+      # --- Host / URL ---
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: ${N8N_PORT:-5678}
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Asia/Kolkata}
+
+      # --- Database (n8n internal state) ---
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-n8n_db}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-n8n}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-n8n_secret}
+
+      # --- Execution settings ---
+      EXECUTIONS_PROCESS: main
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: true
+      EXECUTIONS_DATA_PRUNE: true
+      EXECUTIONS_DATA_MAX_AGE: 336   # hours — keep 2 weeks
+
+      # --- Pass-through env vars for use inside HTTP Request nodes ---
+      # These are available as {{ $env.VARIABLE }} inside n8n expressions
+      NODE_FUNCTION_ALLOW_EXTERNAL: axios,moment,lodash
+
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    extra_hosts:
+      # Lets n8n reach a Node.js backend running on the host machine
+      - "host.docker.internal:host-gateway"
+
+  # ── pgAdmin (optional GUI) ──────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: n8n_pgadmin
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    profiles:
+      - debug   # only starts with: docker compose --profile debug up -d
+
+volumes:
+  postgres_data:
+  n8n_data:
+  pgadmin_data:
