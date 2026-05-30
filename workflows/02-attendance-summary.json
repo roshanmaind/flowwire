@@ -1,0 +1,166 @@
+{
+  "name": "02 · Attendance Summary — GPS Check-ins → Daily Report → WhatsApp",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 18 * * 1-6"
+            }
+          ]
+        }
+      },
+      "id": "node-cron",
+      "name": "Daily 6 PM Trigger (Mon–Sat)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Fires every weekday + Saturday at 18:00 IST. Adjust the cron expression or timezone via GENERIC_TIMEZONE in docker-compose."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  e.id            AS employee_id,\n  e.name          AS employee_name,\n  e.department,\n  e.manager_phone,\n  ci.check_in_time,\n  ci.check_out_time,\n  ci.lat_in,\n  ci.lng_in,\n  ci.lat_out,\n  ci.lng_out,\n  ci.status,\n  ROUND(\n    EXTRACT(EPOCH FROM (ci.check_out_time - ci.check_in_time)) / 3600.0,\n    2\n  ) AS hours_worked\nFROM check_ins ci\nJOIN employees e ON e.id = ci.employee_id\nWHERE ci.check_in_time::date = CURRENT_DATE\nORDER BY e.department, e.name;",
+        "additionalFields": {}
+      },
+      "id": "node-fetch-checkins",
+      "name": "Fetch Today's Check-ins",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate check-ins by department and build a summary object.\nconst rows = $input.all().map(i => i.json);\n\nconst today = new Date().toLocaleDateString('en-IN', {\n  day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata'\n});\n\nconst deptMap = {};\nfor (const row of rows) {\n  const dept = row.department || 'Unassigned';\n  if (!deptMap[dept]) deptMap[dept] = { present: 0, absent: 0, late: 0, employees: [] };\n\n  const status = row.status || 'present';\n  if (status === 'absent') deptMap[dept].absent++;\n  else if (status === 'late') { deptMap[dept].late++; deptMap[dept].present++; }\n  else deptMap[dept].present++;\n\n  deptMap[dept].employees.push({\n    name:         row.employee_name,\n    status,\n    hours_worked: row.hours_worked ?? 0,\n    check_in:     row.check_in_time\n      ? new Date(row.check_in_time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })\n      : '—',\n    check_out:    row.check_out_time\n      ? new Date(row.check_out_time).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' })\n      : 'Not checked out',\n  });\n}\n\nconst totalPresent = rows.filter(r => r.status !== 'absent').length;\nconst totalAbsent  = rows.filter(r => r.status === 'absent').length;\nconst totalLate    = rows.filter(r => r.status === 'late').length;\n\n// Build a human-readable WhatsApp message (plain text, 1024 char limit per section)\nlet message = `📋 *Attendance Report — ${today}*\\n`;\nmessage += `━━━━━━━━━━━━━━━━━━━━━━\\n`;\nmessage += `✅ Present : ${totalPresent}\\n`;\nmessage += `❌ Absent  : ${totalAbsent}\\n`;\nmessage += `⏰ Late    : ${totalLate}\\n\\n`;\n\nfor (const [dept, data] of Object.entries(deptMap)) {\n  message += `*${dept}* (P:${data.present} A:${data.absent} L:${data.late})\\n`;\n  for (const emp of data.employees) {\n    const icon = emp.status === 'absent' ? '❌' : emp.status === 'late' ? '⏰' : '✅';\n    message += `  ${icon} ${emp.name} — In: ${emp.check_in} | Out: ${emp.check_out} | ${emp.hours_worked}h\\n`;\n  }\n  message += '\\n';\n}\n\nreturn [{\n  json: {\n    date: today,\n    total_present: totalPresent,\n    total_absent:  totalAbsent,\n    total_late:    totalLate,\n    departments:   deptMap,\n    whatsapp_message: message.trim(),\n    raw_rows: rows,\n  }\n}];"
+      },
+      "id": "node-aggregate",
+      "name": "Aggregate & Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT DISTINCT manager_phone FROM employees WHERE manager_phone IS NOT NULL AND active = true;",
+        "additionalFields": {}
+      },
+      "id": "node-fetch-managers",
+      "name": "Fetch Manager Phone Numbers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the report (from previous step via $('Aggregate & Build Report'))\n// with each manager phone to send individual WhatsApp messages.\nconst report = $('Aggregate & Build Report').first().json;\nconst managers = $input.all().map(i => i.json);\n\nreturn managers.map(mgr => ({\n  json: {\n    ...report,\n    recipient_phone: mgr.manager_phone.replace(/[^0-9]/g, ''),\n  }\n}));"
+      },
+      "id": "node-merge-recipients",
+      "name": "Merge Report + Recipients",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.recipient_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": {{ JSON.stringify($json.whatsapp_message) }}\n  }\n}",
+        "options": {}
+      },
+      "id": "node-send-whatsapp",
+      "name": "Send Report via WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API"
+        }
+      },
+      "notes": "⚙ CONFIGURE: WhatsApp Cloud API credential — Header: Authorization, Value: Bearer <ACCESS_TOKEN>"
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "attendance_reports",
+        "columns": "report_date,total_present,total_absent,total_late,report_json,sent_at",
+        "additionalFields": {}
+      },
+      "id": "node-save-report",
+      "name": "Archive Report to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1560, 300],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 6 PM Trigger (Mon–Sat)": {
+      "main": [
+        [{ "node": "Fetch Today's Check-ins", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Today's Check-ins": {
+      "main": [
+        [{ "node": "Aggregate & Build Report", "type": "main", "index": 0 }]
+      ]
+    },
+    "Aggregate & Build Report": {
+      "main": [
+        [{ "node": "Fetch Manager Phone Numbers", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Manager Phone Numbers": {
+      "main": [
+        [{ "node": "Merge Report + Recipients", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge Report + Recipients": {
+      "main": [
+        [{ "node": "Send Report via WhatsApp", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Report via WhatsApp": {
+      "main": [
+        [{ "node": "Archive Report to DB", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["attendance", "gps", "whatsapp", "report", "cron"],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-15T00:00:00.000Z",
+  "versionId": "v1.0.0"
+}

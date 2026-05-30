@@ -1,0 +1,267 @@
+{
+  "name": "03 · Expense Submission — WhatsApp Photo → R2 → PostgreSQL",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-inbound",
+        "authentication": "none",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "node-wa-webhook",
+      "name": "WhatsApp Inbound Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "whatsapp-inbound-webhook",
+      "notes": "⚙ CONFIGURE: In Meta Developer Console → WhatsApp → Configuration, set Webhook URL to https://<your-n8n-host>/webhook/whatsapp-inbound and subscribe to the 'messages' field."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract message details from WhatsApp Cloud API webhook payload.\nconst body = $input.first().json.body;\nconst entry   = (body?.entry        || [])[0];\nconst changes = (entry?.changes      || [])[0];\nconst value   = changes?.value       || {};\nconst messages = value?.messages     || [];\n\nif (messages.length === 0) {\n  // Webhook verification or status update — skip\n  return [];\n}\n\nconst msg = messages[0];\nconst from = msg.from; // sender's phone (E.164 without '+')\n\n// Only handle image messages for expense submissions\nif (msg.type !== 'image') {\n  return [{ json: { skip: true, reason: 'not_image', from } }];\n}\n\nconst image = msg.image || {};\nreturn [{\n  json: {\n    skip:         false,\n    from,\n    media_id:     image.id,\n    mime_type:    image.mime_type,\n    caption:      image.caption || '',\n    wa_msg_id:    msg.id,\n    timestamp:    msg.timestamp\n      ? new Date(parseInt(msg.timestamp) * 1000).toISOString()\n      : new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "node-parse-wa",
+      "name": "Parse WhatsApp Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.skip }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "node-is-image",
+      "name": "Is Image?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.media_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "node-get-media-url",
+      "name": "Get Media Download URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "node-download-image",
+      "name": "Download Receipt Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API"
+        }
+      },
+      "notes": "Downloads the binary image from WhatsApp's CDN. Stored as binary data in n8n."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a unique S3/R2 object key for this receipt.\nconst from = $('Parse WhatsApp Payload').first().json.from;\nconst ts   = $('Parse WhatsApp Payload').first().json.timestamp;\nconst mime = $('Parse WhatsApp Payload').first().json.mime_type || 'image/jpeg';\nconst ext  = mime.split('/')[1] || 'jpg';\n\nconst date = new Date(ts);\nconst ymd  = `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;\n\nconst key = `expenses/${from}/${ymd}/${Date.now()}.${ext}`;\n\nreturn [{\n  json: {\n    ...($('Parse WhatsApp Payload').first().json),\n    r2_key: key,\n    mime_type: mime,\n  }\n}];"
+      },
+      "id": "node-build-r2-key",
+      "name": "Build R2 Object Key",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucket": "={{ $env.R2_BUCKET_NAME }}",
+        "fileKey": "={{ $json.r2_key }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "contentType": "={{ $json.mime_type }}"
+        }
+      },
+      "id": "node-upload-r2",
+      "name": "Upload to Cloudflare R2",
+      "type": "n8n-nodes-base.s3",
+      "typeVersion": 1,
+      "position": [1560, 200],
+      "credentials": {
+        "s3": {
+          "id": "R2_CREDENTIAL_ID",
+          "name": "Cloudflare R2"
+        }
+      },
+      "notes": "⚙ CONFIGURE: Create an 'S3' credential named 'Cloudflare R2'. Set endpoint to https://<ACCOUNT_ID>.r2.cloudflarestorage.com, region to auto, and provide R2 access key + secret."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name FROM employees WHERE phone = $1 LIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ $('Parse WhatsApp Payload').first().json.from }}"
+        }
+      },
+      "id": "node-lookup-employee",
+      "name": "Lookup Employee by Phone",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1780, 200],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const upload  = $('Upload to Cloudflare R2').first().json;\nconst wa      = $('Parse WhatsApp Payload').first().json;\nconst emp     = $input.first().json;\nconst caption = wa.caption || '';\n\n// Try to parse an amount from the caption, e.g. '₹450 taxi'\nconst amountMatch = caption.match(/(₹|Rs\\.?|INR)?\\s*(\\d+(\\.\\d{1,2})?)/);\nconst amount = amountMatch ? parseFloat(amountMatch[2]) : null;\n\nconst r2Url = `https://${$env.R2_BUCKET_NAME}.${$env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${wa.r2_key}`;\n\nreturn [{\n  json: {\n    employee_id:   emp?.id          || null,\n    employee_name: emp?.name        || 'Unknown',\n    phone:         wa.from,\n    caption:       caption,\n    amount:        amount,\n    currency:      'INR',\n    receipt_url:   r2Url,\n    r2_key:        wa.r2_key,\n    wa_msg_id:     wa.wa_msg_id,\n    submitted_at:  wa.timestamp,\n    status:        'pending_review',\n  }\n}];"
+      },
+      "id": "node-build-expense-record",
+      "name": "Build Expense Record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "expense_submissions",
+        "columns": "employee_id,employee_name,phone,caption,amount,currency,receipt_url,r2_key,wa_msg_id,submitted_at,status",
+        "additionalFields": {}
+      },
+      "id": "node-insert-expense",
+      "name": "Save Expense to PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2220, 200],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $('Parse WhatsApp Payload').first().json.from }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"✅ Your expense receipt has been received and is pending approval.\\n\\n📎 Reference ID: {{ $json.id }}\\n💰 Amount detected: {{ $json.amount ? '₹' + $json.amount : 'Not parsed — please mention amount in caption' }}\\n\\nYour manager will review it shortly.\"\n  }\n}",
+        "options": {}
+      },
+      "id": "node-confirm-wa",
+      "name": "Send WhatsApp Confirmation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2440, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Inbound Webhook": {
+      "main": [
+        [{ "node": "Parse WhatsApp Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse WhatsApp Payload": {
+      "main": [
+        [{ "node": "Is Image?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Image?": {
+      "main": [
+        [{ "node": "Get Media Download URL", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Get Media Download URL": {
+      "main": [
+        [{ "node": "Download Receipt Image", "type": "main", "index": 0 }]
+      ]
+    },
+    "Download Receipt Image": {
+      "main": [
+        [{ "node": "Build R2 Object Key", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build R2 Object Key": {
+      "main": [
+        [{ "node": "Upload to Cloudflare R2", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upload to Cloudflare R2": {
+      "main": [
+        [{ "node": "Lookup Employee by Phone", "type": "main", "index": 0 }]
+      ]
+    },
+    "Lookup Employee by Phone": {
+      "main": [
+        [{ "node": "Build Expense Record", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Expense Record": {
+      "main": [
+        [{ "node": "Save Expense to PostgreSQL", "type": "main", "index": 0 }]
+      ]
+    },
+    "Save Expense to PostgreSQL": {
+      "main": [
+        [{ "node": "Send WhatsApp Confirmation", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["expense", "whatsapp", "cloudflare-r2", "postgresql"],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-15T00:00:00.000Z",
+  "versionId": "v1.0.0"
+}

@@ -1,0 +1,281 @@
+{
+  "name": "04 · Social Media Scheduler — Webhook → Instagram · Facebook · LinkedIn",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "schedule-post",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "node-webhook-scheduler",
+      "name": "Schedule Post Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 400],
+      "webhookId": "social-schedule-webhook",
+      "notes": "⚙ CONFIGURE: Protect this webhook with Header Auth. In n8n, create an 'Header Auth' credential and set Authorization: Bearer <BACKEND_API_SECRET>. Your Node.js backend POSTs here with { caption, image_url, platforms: ['instagram','facebook','linkedin'] }"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and normalise the incoming post request.\nconst body = $input.first().json.body;\n\nconst caption      = body?.caption?.trim();\nconst image_url    = body?.image_url?.trim();\nconst platforms    = Array.isArray(body?.platforms) ? body.platforms : ['instagram', 'facebook', 'linkedin'];\nconst scheduled_at = body?.scheduled_at ? new Date(body.scheduled_at) : null;\n\nif (!caption) throw new Error('Validation: caption is required');\nif (!image_url) throw new Error('Validation: image_url is required');\n\n// Truncate caption per platform limit (Instagram: 2200, FB: 63206, LI: 3000)\nconst captions = {\n  instagram: caption.slice(0, 2200),\n  facebook:  caption.slice(0, 63206),\n  linkedin:  caption.slice(0, 3000),\n};\n\nreturn [{\n  json: {\n    caption,\n    image_url,\n    platforms,\n    captions,\n    scheduled_at: scheduled_at?.toISOString() || new Date().toISOString(),\n    post_id: `post_${Date.now()}`,\n  }\n}];"
+      },
+      "id": "node-validate",
+      "name": "Validate & Normalise Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.platforms.join(',') }}",
+              "operation": "contains",
+              "value2": "instagram"
+            }
+          ]
+        }
+      },
+      "id": "node-check-ig",
+      "name": "Post to Instagram?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.platforms.join(',') }}",
+              "operation": "contains",
+              "value2": "facebook"
+            }
+          ]
+        }
+      },
+      "id": "node-check-fb",
+      "name": "Post to Facebook?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.platforms.join(',') }}",
+              "operation": "contains",
+              "value2": "linkedin"
+            }
+          ]
+        }
+      },
+      "id": "node-check-li",
+      "name": "Post to LinkedIn?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 620]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.INSTAGRAM_BUSINESS_ACCOUNT_ID }}/media",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"image_url\": \"{{ $json.image_url }}\",\n  \"caption\": {{ JSON.stringify($json.captions.instagram) }},\n  \"access_token\": \"{{ $credentials.accessToken }}\"\n}",
+        "options": {}
+      },
+      "id": "node-ig-container",
+      "name": "IG: Create Media Container",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [980, 100],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "IG_CREDENTIAL_ID",
+          "name": "Instagram Graph API"
+        }
+      },
+      "notes": "⚙ CONFIGURE: 'Instagram Graph API' credential — Header: Authorization, Value: Bearer <INSTAGRAM_ACCESS_TOKEN>"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.INSTAGRAM_BUSINESS_ACCOUNT_ID }}/media_publish",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"creation_id\": \"{{ $json.id }}\",\n  \"access_token\": \"{{ $credentials.accessToken }}\"\n}",
+        "options": {}
+      },
+      "id": "node-ig-publish",
+      "name": "IG: Publish Container",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1200, 100],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "IG_CREDENTIAL_ID",
+          "name": "Instagram Graph API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.FACEBOOK_PAGE_ID }}/photos",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"url\": \"{{ $('Validate & Normalise Payload').first().json.image_url }}\",\n  \"message\": {{ JSON.stringify($('Validate & Normalise Payload').first().json.captions.facebook) }},\n  \"access_token\": \"{{ $credentials.accessToken }}\"\n}",
+        "options": {}
+      },
+      "id": "node-fb-post",
+      "name": "FB: Post Photo to Page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [980, 400],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "FB_CREDENTIAL_ID",
+          "name": "Facebook Graph API"
+        }
+      },
+      "notes": "⚙ CONFIGURE: 'Facebook Graph API' credential — Header: Authorization, Value: Bearer <PAGE_ACCESS_TOKEN>"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/v2/ugcPosts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"author\": \"urn:li:organization:{{ $env.LINKEDIN_ORGANIZATION_ID }}\",\n  \"lifecycleState\": \"PUBLISHED\",\n  \"specificContent\": {\n    \"com.linkedin.ugc.ShareContent\": {\n      \"shareCommentary\": {\n        \"text\": {{ JSON.stringify($('Validate & Normalise Payload').first().json.captions.linkedin) }}\n      },\n      \"shareMediaCategory\": \"IMAGE\",\n      \"media\": [\n        {\n          \"status\": \"READY\",\n          \"description\": { \"text\": \"\" },\n          \"originalUrl\": \"{{ $('Validate & Normalise Payload').first().json.image_url }}\"\n        }\n      ]\n    }\n  },\n  \"visibility\": {\n    \"com.linkedin.ugc.MemberNetworkVisibility\": \"PUBLIC\"\n  }\n}",
+        "options": {}
+      },
+      "id": "node-li-post",
+      "name": "LI: Create UGC Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [980, 620],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "LI_CREDENTIAL_ID",
+          "name": "LinkedIn API"
+        }
+      },
+      "notes": "⚙ CONFIGURE: 'LinkedIn API' credential — Header: Authorization, Value: Bearer <LINKEDIN_ACCESS_TOKEN>"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect results from all three branches and build a summary.\nconst base = $('Validate & Normalise Payload').first().json;\n\nconst results = {\n  post_id:      base.post_id,\n  caption:      base.caption.slice(0, 80) + '...',\n  image_url:    base.image_url,\n  platforms:    base.platforms,\n  published_at: new Date().toISOString(),\n  ig_post_id:   null,\n  fb_post_id:   null,\n  li_post_id:   null,\n};\n\ntry { results.ig_post_id = $('IG: Publish Container').first().json.id || null; } catch(_) {}\ntry { results.fb_post_id = $('FB: Post Photo to Page').first().json.id || null; } catch(_) {}\ntry { results.li_post_id = $('LI: Create UGC Post').first().json.id   || null; } catch(_) {}\n\nreturn [{ json: results }];"
+      },
+      "id": "node-merge-results",
+      "name": "Merge Publish Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "social_posts",
+        "columns": "post_id,caption,image_url,platforms,ig_post_id,fb_post_id,li_post_id,published_at,status",
+        "additionalFields": {}
+      },
+      "id": "node-save-post",
+      "name": "Save Post Record to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1640, 400],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Post Webhook": {
+      "main": [
+        [{ "node": "Validate & Normalise Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Validate & Normalise Payload": {
+      "main": [
+        [
+          { "node": "Post to Instagram?", "type": "main", "index": 0 },
+          { "node": "Post to Facebook?",  "type": "main", "index": 0 },
+          { "node": "Post to LinkedIn?",  "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Post to Instagram?": {
+      "main": [
+        [{ "node": "IG: Create Media Container", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "IG: Create Media Container": {
+      "main": [
+        [{ "node": "IG: Publish Container", "type": "main", "index": 0 }]
+      ]
+    },
+    "IG: Publish Container": {
+      "main": [
+        [{ "node": "Merge Publish Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Post to Facebook?": {
+      "main": [
+        [{ "node": "FB: Post Photo to Page", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "FB: Post Photo to Page": {
+      "main": [
+        [{ "node": "Merge Publish Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Post to LinkedIn?": {
+      "main": [
+        [{ "node": "LI: Create UGC Post", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "LI: Create UGC Post": {
+      "main": [
+        [{ "node": "Merge Publish Results", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge Publish Results": {
+      "main": [
+        [{ "node": "Save Post Record to DB", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["social-media", "instagram", "facebook", "linkedin", "scheduler"],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-15T00:00:00.000Z",
+  "versionId": "v1.0.0"
+}

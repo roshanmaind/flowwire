@@ -1,0 +1,188 @@
+{
+  "name": "05 · Missed Call Alert — Exotel Webhook → WhatsApp Callback",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "exotel-missed-call",
+        "authentication": "none",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "node-exotel-webhook",
+      "name": "Exotel Missed Call Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "exotel-missed-call-webhook",
+      "notes": "⚙ CONFIGURE: In your Exotel Dashboard → Apps → Passthru App (or Flow), set the 'Status Callback URL' to https://<your-n8n-host>/webhook/exotel-missed-call. Exotel sends form-encoded POST data."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Exotel sends application/x-www-form-urlencoded.\n// n8n auto-parses it into json if content-type is set correctly.\n// Relevant fields: CallSid, From, To, Status, Direction, StartTime, EndTime\nconst body = $input.first().json.body || $input.first().json;\n\nconst status    = (body.Status || body.CallStatus || '').toLowerCase();\nconst from      = body.From    || body.CallFrom || '';\nconst to        = body.To      || body.CallTo   || '';\nconst callSid   = body.CallSid || body.Sid      || '';\nconst startTime = body.StartTime ? new Date(body.StartTime).toISOString() : new Date().toISOString();\n\n// Only process missed / no-answer calls\nconst isMissed = ['no-answer', 'busy', 'failed', 'missed'].includes(status);\n\nif (!isMissed) {\n  return [{ json: { skip: true, status, callSid } }];\n}\n\n// Normalise phone to E.164 (Exotel may send with leading 0 or +91)\nconst normalisePhone = (raw) => {\n  const digits = raw.replace(/[^0-9]/g, '');\n  if (digits.startsWith('91') && digits.length === 12) return digits;\n  if (digits.length === 10) return `91${digits}`;\n  return digits;\n};\n\nreturn [{\n  json: {\n    skip:         false,\n    call_sid:     callSid,\n    caller_raw:   from,\n    caller_phone: normalisePhone(from),\n    called_phone: normalisePhone(to),\n    status,\n    started_at:   startTime,\n  }\n}];"
+      },
+      "id": "node-parse-exotel",
+      "name": "Parse Exotel Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.skip }}",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "node-is-missed",
+      "name": "Is Missed Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, department FROM employees WHERE phone LIKE $1 OR phone LIKE $2 LIMIT 1;",
+        "additionalFields": {
+          "queryParams": "={{ $json.caller_phone }}, %{{ $json.caller_phone.slice(-10) }}"
+        }
+      },
+      "id": "node-lookup-caller",
+      "name": "Lookup Caller in DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [900, 200],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      },
+      "notes": "Checks if the caller is a known employee or customer. Unknown callers still get a WhatsApp message."
+    },
+    {
+      "parameters": {
+        "jsCode": "const missed   = $('Parse Exotel Payload').first().json;\nconst employee = $input.first().json || {};\n\nconst callerName  = employee?.name || 'there';\nconst calledAt    = new Date(missed.started_at).toLocaleTimeString('en-IN', {\n  hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata'\n});\n\nconst waMessage = `Hi ${callerName} 👋\\n\\nWe noticed you called us at *${calledAt}* but we couldn't connect.\\n\\nA team member will call you back shortly. If it's urgent, reply to this message and we'll prioritise your query.\\n\\n— Team`;\n\nreturn [{\n  json: {\n    ...missed,\n    caller_name:   callerName,\n    employee_id:   employee?.id         || null,\n    department:    employee?.department  || null,\n    whatsapp_msg:  waMessage,\n  }\n}];"
+      },
+      "id": "node-build-wa-msg",
+      "name": "Build WhatsApp Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.caller_phone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": {{ JSON.stringify($json.whatsapp_msg) }}\n  }\n}",
+        "options": {}
+      },
+      "id": "node-send-wa-callback",
+      "name": "Send WhatsApp Callback Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "missed_calls",
+        "columns": "call_sid,caller_phone,called_phone,employee_id,status,started_at,wa_sent_at",
+        "additionalFields": {}
+      },
+      "id": "node-log-missed-call",
+      "name": "Log Missed Call to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1560, 200],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BACKEND_API_URL }}/api/internal/calls/missed",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify($('Build WhatsApp Message').first().json) }}",
+        "options": {}
+      },
+      "id": "node-notify-backend",
+      "name": "Notify Backend Service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1780, 200],
+      "notes": "Optional: push the event to your Node.js backend so it can update CRM state, assign a follow-up task, etc."
+    }
+  ],
+  "connections": {
+    "Exotel Missed Call Webhook": {
+      "main": [
+        [{ "node": "Parse Exotel Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Exotel Payload": {
+      "main": [
+        [{ "node": "Is Missed Call?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Missed Call?": {
+      "main": [
+        [{ "node": "Lookup Caller in DB", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Lookup Caller in DB": {
+      "main": [
+        [{ "node": "Build WhatsApp Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build WhatsApp Message": {
+      "main": [
+        [{ "node": "Send WhatsApp Callback Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send WhatsApp Callback Message": {
+      "main": [
+        [{ "node": "Log Missed Call to DB", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log Missed Call to DB": {
+      "main": [
+        [{ "node": "Notify Backend Service", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["missed-call", "exotel", "whatsapp", "telephony"],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-15T00:00:00.000Z",
+  "versionId": "v1.0.0"
+}

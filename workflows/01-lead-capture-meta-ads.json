@@ -1,0 +1,186 @@
+{
+  "name": "01 · Lead Capture — Meta Ads → PostgreSQL → WhatsApp",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta-ads-lead",
+        "authentication": "none",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "node-webhook-meta",
+      "name": "Meta Ads Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "meta-ads-lead-webhook",
+      "notes": "⚙ CONFIGURE: In Meta Ads Manager → Lead Ads → CRM Integration, set the Webhook URL to https://<your-n8n-host>/webhook/meta-ads-lead"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the Meta Lead Ads webhook payload.\n// Meta sends an array of 'entry' objects, each containing 'changes'.\nconst body = $input.first().json.body;\n\nconst entries = body?.entry || [];\nconst leads = [];\n\nfor (const entry of entries) {\n  for (const change of (entry.changes || [])) {\n    if (change.field === 'leadgen') {\n      const value = change.value || {};\n      leads.push({\n        leadgen_id:   value.leadgen_id   || '',\n        page_id:      value.page_id      || '',\n        ad_id:        value.ad_id        || '',\n        form_id:      value.form_id      || '',\n        campaign_id:  value.ad_id        || '',\n        created_time: value.created_time\n          ? new Date(value.created_time * 1000).toISOString()\n          : new Date().toISOString(),\n      });\n    }\n  }\n}\n\nif (leads.length === 0) {\n  // Verification ping from Meta — respond 200, stop processing\n  return [];\n}\n\nreturn leads.map(l => ({ json: l }));"
+      },
+      "id": "node-parse-lead",
+      "name": "Parse Lead Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v19.0/{{ $json.leadgen_id }}?fields=field_data,created_time,ad_name,campaign_name,form_id&access_token={{ $credentials.accessToken }}",
+        "options": {}
+      },
+      "id": "node-fetch-lead-detail",
+      "name": "Fetch Lead Details from Graph API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [680, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "META_ADS_CREDENTIAL_ID",
+          "name": "Meta Ads Access Token"
+        }
+      },
+      "notes": "⚙ CONFIGURE: Create an 'HTTP Header Auth' credential named 'Meta Ads Access Token' with Header=Authorization, Value=Bearer <LONG_LIVED_TOKEN>"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten the field_data array returned by Graph API into a plain object.\n// field_data = [{ name: 'full_name', values: ['John Doe'] }, ...]\nconst item = $input.first().json;\nconst fields = {};\nfor (const f of (item.field_data || [])) {\n  fields[f.name] = (f.values || [])[0] || null;\n}\n\nreturn [{\n  json: {\n    leadgen_id:    item.id,\n    full_name:     fields.full_name   || fields.name     || null,\n    phone:         fields.phone_number || fields.phone   || null,\n    email:         fields.email                          || null,\n    city:          fields.city                           || null,\n    ad_name:       item.ad_name       || null,\n    campaign_name: item.campaign_name || null,\n    form_id:       item.form_id       || null,\n    created_at:    item.created_time\n      ? new Date(item.created_time * 1000).toISOString()\n      : new Date().toISOString(),\n    status:        'new',\n  }\n}];"
+      },
+      "id": "node-flatten-fields",
+      "name": "Flatten Field Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "leads",
+        "columns": "leadgen_id,full_name,phone,email,city,ad_name,campaign_name,form_id,created_at,status",
+        "additionalFields": {
+          "onConflict": "leadgen_id"
+        }
+      },
+      "id": "node-insert-postgres",
+      "name": "Save Lead to PostgreSQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "Business DB — PostgreSQL"
+        }
+      },
+      "notes": "⚙ CONFIGURE: Create a 'Postgres' credential named 'Business DB — PostgreSQL' with host, port, database, user, password matching your .env"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.phone }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "id": "node-check-phone",
+      "name": "Has Phone Number?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"messaging_product\": \"whatsapp\",\n  \"to\": \"{{ $json.phone.replace(/[^0-9]/g, '') }}\",\n  \"type\": \"template\",\n  \"template\": {\n    \"name\": \"lead_welcome\",\n    \"language\": { \"code\": \"en\" },\n    \"components\": [\n      {\n        \"type\": \"body\",\n        \"parameters\": [\n          { \"type\": \"text\", \"text\": \"{{ $json.full_name }}\" }\n        ]\n      }\n    ]\n  }\n}",
+        "options": {}
+      },
+      "id": "node-whatsapp-welcome",
+      "name": "Send WhatsApp Welcome",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API"
+        }
+      },
+      "notes": "⚙ CONFIGURE: Create 'HTTP Header Auth' credential named 'WhatsApp Cloud API' — Header: Authorization, Value: Bearer <WHATSAPP_ACCESS_TOKEN>. Also ensure the 'lead_welcome' template is approved in Meta Business Manager."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.BACKEND_API_URL }}/api/internal/leads/notify-no-phone",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "node-no-phone-fallback",
+      "name": "Notify Backend — No Phone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1560, 420],
+      "notes": "Fallback: if the lead has no phone, ping your backend so a human can follow up."
+    }
+  ],
+  "connections": {
+    "Meta Ads Webhook": {
+      "main": [
+        [{ "node": "Parse Lead Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Lead Payload": {
+      "main": [
+        [{ "node": "Fetch Lead Details from Graph API", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Lead Details from Graph API": {
+      "main": [
+        [{ "node": "Flatten Field Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "Flatten Field Data": {
+      "main": [
+        [{ "node": "Save Lead to PostgreSQL", "type": "main", "index": 0 }]
+      ]
+    },
+    "Save Lead to PostgreSQL": {
+      "main": [
+        [{ "node": "Has Phone Number?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Has Phone Number?": {
+      "main": [
+        [{ "node": "Send WhatsApp Welcome", "type": "main", "index": 0 }],
+        [{ "node": "Notify Backend — No Phone", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["leads", "meta-ads", "whatsapp", "postgresql"],
+  "triggerCount": 1,
+  "updatedAt": "2024-01-15T00:00:00.000Z",
+  "versionId": "v1.0.0"
+}
