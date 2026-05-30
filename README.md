@@ -1,4 +1,4 @@
-# n8n Business Automation Suite
+# flowwire
 
 Production-ready [n8n](https://n8n.io) workflow automations for a modern business management system. All workflows are fully exportable and importable into any self-hosted or cloud n8n instance.
 
