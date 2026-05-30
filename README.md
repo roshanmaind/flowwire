@@ -94,8 +94,8 @@ graph TD
 ### 1. Clone & Start
 
 ```bash
-git clone https://github.com/<your-username>/n8n-business-automation.git
-cd n8n-business-automation
+git clone https://github.com/<your-username>/flowwire.git
+cd flowwire
 cp .env.example .env          # fill in your credentials
 docker compose up -d
 ```
@@ -120,7 +120,7 @@ See [docs/INTEGRATION.md](docs/INTEGRATION.md) for how each workflow exposes web
 ## Repository Structure
 
 ```
-n8n-business-automation/
+flowwire/
 ├── workflows/
 │   ├── 01-lead-capture-meta-ads.json
 │   ├── 02-attendance-summary.json
