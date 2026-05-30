@@ -26,6 +26,34 @@ Automatically captures leads generated from Meta (Facebook/Instagram) Lead Ads, 
 - **Source:** Meta Ads Lead Ads webhook (fires when a user submits a Lead Ad form)
 - **Verification:** Meta sends a `GET` ping with a `hub.challenge` token on initial setup — the webhook responds automatically
 
+### Flow Diagram
+
+```mermaid
+sequenceDiagram
+    actor Lead as 🧑 Lead
+    participant Meta as Meta Ads
+    participant n8n as n8n Engine
+    participant Graph as Graph API
+    participant PG as PostgreSQL
+    participant WA as WhatsApp API
+
+    Lead->>Meta: Submits Lead Ad form
+    Meta->>n8n: POST /webhook/meta-ads-lead\n{ entry[].changes[].value.leadgen_id }
+    n8n->>n8n: Parse payload → extract leadgen_id
+    n8n->>Graph: GET /v19.0/{leadgen_id}?fields=field_data,…
+    Graph-->>n8n: { field_data: [{ name, values }] }
+    n8n->>n8n: Flatten field_data → { full_name, phone, email, … }
+    n8n->>PG: INSERT INTO leads ON CONFLICT DO NOTHING
+    PG-->>n8n: OK
+
+    alt Phone number present
+        n8n->>WA: POST /messages — template: lead_welcome
+        WA-->>Lead: 📲 WhatsApp welcome message
+    else No phone number
+        n8n->>n8n: POST /api/internal/leads/notify-no-phone
+    end
+```
+
 ### Nodes & Steps
 
 | # | Node | Action |
@@ -77,6 +105,30 @@ Every evening at 6 PM (Mon–Sat), aggregates GPS-based employee check-in / chec
 - **Type:** Schedule (Cron)
 - **Expression:** `0 18 * * 1-6` — 18:00 every Monday through Saturday
 - **Timezone:** Controlled by `GENERIC_TIMEZONE` env var (default: `Asia/Kolkata`)
+
+### Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant Cron as ⏰ Cron (18:00)
+    participant n8n as n8n Engine
+    participant PG as PostgreSQL
+    participant WA as WhatsApp API
+    participant Mgr as 👔 Manager(s)
+
+    Cron->>n8n: Trigger (Mon–Sat 18:00 IST)
+    n8n->>PG: SELECT check_ins JOIN employees\nWHERE date = CURRENT_DATE
+    PG-->>n8n: [ { employee, dept, status, hours } × N ]
+    n8n->>n8n: Group by dept · count P/A/L\nBuild WhatsApp message string
+    n8n->>PG: SELECT DISTINCT manager_phone\nFROM employees WHERE active
+    PG-->>n8n: [ { manager_phone } × M ]
+    n8n->>n8n: Merge → M output items (one per manager)
+    loop For each manager
+        n8n->>WA: POST /messages — type: text\n(attendance report)
+        WA-->>Mgr: 📲 Daily attendance report
+    end
+    n8n->>PG: INSERT INTO attendance_reports\n(report_date, totals, report_json)
+```
 
 ### Nodes & Steps
 
@@ -149,6 +201,36 @@ Employees submit travel/expense receipts by simply sending a photo on WhatsApp w
 - **Type:** HTTP Webhook (`POST /webhook/whatsapp-inbound`)
 - **Source:** WhatsApp Cloud API webhook (fires on every inbound message)
 
+### Flow Diagram
+
+```mermaid
+sequenceDiagram
+    actor Emp as 👤 Employee
+    participant WA as WhatsApp Cloud API
+    participant n8n as n8n Engine
+    participant Graph as Meta Graph API
+    participant R2 as Cloudflare R2
+    participant PG as PostgreSQL
+
+    Emp->>WA: Sends receipt photo\ncaption: "₹450 taxi"
+    WA->>n8n: POST /webhook/whatsapp-inbound\n{ type: image, media_id, caption, from }
+    n8n->>n8n: Parse payload\nCheck type === image
+    n8n->>Graph: GET /v19.0/{media_id}\n→ temporary CDN URL
+    Graph-->>n8n: { url: "https://cdn.whatsapp.net/…" }
+    n8n->>Graph: GET cdn_url (authenticated)\n→ binary image blob
+    Graph-->>n8n: image/jpeg binary
+    n8n->>n8n: Build key:\nexpenses/{phone}/{date}/{ts}.jpg
+    n8n->>R2: PUT binary → bucket: expense-receipts
+    R2-->>n8n: 200 OK
+    n8n->>PG: SELECT id, name FROM employees\nWHERE phone = sender
+    PG-->>n8n: { id, name } or empty
+    n8n->>n8n: Parse amount from caption regex\n"₹450 taxi" → 450
+    n8n->>PG: INSERT INTO expense_submissions\n(status=pending_review, receipt_url, …)
+    PG-->>n8n: { id: 12 }
+    n8n->>WA: POST /messages — type: text\n"✅ Received. Ref #12. Amount: ₹450"
+    WA-->>Emp: 📲 Confirmation message
+```
+
 ### Nodes & Steps
 
 | # | Node | Action |
@@ -217,6 +299,39 @@ A single webhook endpoint that accepts a post payload (caption + image URL + tar
 }
 ```
 
+### Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant BE as Node.js Backend
+    participant n8n as n8n Engine
+    participant IG as Instagram API
+    participant FB as Facebook API
+    participant LI as LinkedIn API
+    participant PG as PostgreSQL
+
+    BE->>n8n: POST /webhook/schedule-post\nAuthorization: Bearer SECRET\n{ caption, image_url, platforms }
+    n8n->>n8n: Validate payload\nTrim captions per platform limit\nGenerate post_id
+
+    par Instagram (2-step publish)
+        n8n->>IG: POST /v19.0/{ig_id}/media\n{ image_url, caption }
+        IG-->>n8n: { id: creation_id }
+        n8n->>IG: POST /v19.0/{ig_id}/media_publish\n{ creation_id }
+        IG-->>n8n: { id: ig_post_id }
+    and Facebook
+        n8n->>FB: POST /v19.0/{page_id}/photos\n{ url, message }
+        FB-->>n8n: { id: fb_post_id }
+    and LinkedIn
+        n8n->>LI: POST /v2/ugcPosts\n{ author, content, visibility }
+        LI-->>n8n: { id: li_post_id }
+    end
+
+    n8n->>n8n: Merge: collect all post IDs
+    n8n->>PG: INSERT INTO social_posts\n(ig_post_id, fb_post_id, li_post_id)
+    PG-->>n8n: OK
+    n8n-->>BE: 200 { post_id, ig_post_id, … }
+```
+
 ### Nodes & Steps
 
 | # | Node | Action |
@@ -273,6 +388,36 @@ When a caller reaches an Exotel number but the call goes unanswered (missed, bus
 - **Type:** HTTP Webhook (`POST /webhook/exotel-missed-call`)
 - **Source:** Exotel — configured as the **Status Callback URL** in your Exotel App or Call Flow
 - **Format:** `application/x-www-form-urlencoded` (Exotel standard)
+
+### Flow Diagram
+
+```mermaid
+sequenceDiagram
+    actor Caller as 📞 Caller
+    participant Exo as Exotel
+    participant n8n as n8n Engine
+    participant PG as PostgreSQL
+    participant WA as WhatsApp API
+    participant BE as Node.js Backend
+
+    Caller->>Exo: Dials business number
+    Exo->>Exo: Rings — no answer / busy
+    Exo->>n8n: POST /webhook/exotel-missed-call\n(form-encoded)\n{ CallSid, From, To, Status: no-answer }
+    n8n->>n8n: Parse payload\nNormalise phone: 09876… → 919876…
+    n8n->>n8n: Check status in\n[no-answer, busy, failed, missed]
+
+    alt Is a missed call
+        n8n->>PG: SELECT id, name, department\nFROM employees WHERE phone
+        PG-->>n8n: { id, name } or empty row
+        n8n->>n8n: Build personalised message\n"Hi Rahul 👋 You called at 02:45 PM…"
+        n8n->>WA: POST /messages — type: text\nto: caller_phone
+        WA-->>Caller: 📲 Callback WhatsApp message
+        n8n->>PG: INSERT INTO missed_calls\n(call_sid, phones, wa_sent_at)
+        n8n->>BE: POST /api/internal/calls/missed\n→ CRM task creation
+    else Not a missed call
+        n8n->>n8n: Stop processing
+    end
+```
 
 ### Nodes & Steps
 

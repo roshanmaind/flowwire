@@ -24,29 +24,62 @@ This project demonstrates five end-to-end automation workflows that integrate Wh
 
 ## Architecture Summary
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    External Triggers / Sources                   │
-│  Meta Ads · WhatsApp Cloud API · Exotel · HTTP Webhooks · Cron  │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   n8n Engine    │
-                    │  (Self-hosted)  │
-                    └────────┬────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-┌────────▼───────┐  ┌────────▼───────┐  ┌────────▼────────┐
-│  PostgreSQL DB │  │ Cloudflare R2  │  │  Social / Comm  │
-│  (leads, att,  │  │ (expense imgs) │  │  APIs (WA, IG,  │
-│   expenses)    │  │                │  │   FB, LinkedIn) │
-└────────────────┘  └────────────────┘  └─────────────────┘
-         │
-┌────────▼────────────┐
-│  Node.js Backend    │
-│  (REST API / BFF)   │
-└─────────────────────┘
+```mermaid
+graph TD
+    subgraph Triggers["External Triggers & Sources"]
+        MA(Meta Ads)
+        WA(WhatsApp Cloud API)
+        EX(Exotel)
+        WH(HTTP Webhook)
+        CR(Cron Scheduler)
+    end
+
+    subgraph n8n["n8n Engine (Self-hosted)"]
+        WF1(WF1 · Lead Capture)
+        WF2(WF2 · Attendance Summary)
+        WF3(WF3 · Expense Submission)
+        WF4(WF4 · Social Scheduler)
+        WF5(WF5 · Missed Call Alert)
+    end
+
+    subgraph Storage["Persistence Layer"]
+        PG[(PostgreSQL)]
+        R2[(Cloudflare R2)]
+    end
+
+    subgraph APIs["External APIs"]
+        WAout(WhatsApp Cloud API)
+        IG(Instagram Graph API)
+        FB(Facebook Graph API)
+        LI(LinkedIn API)
+    end
+
+    BE(Node.js Backend)
+
+    MA -->|lead webhook| WF1
+    WA -->|inbound message| WF3
+    WA -->|inbound message| WF5
+    EX -->|missed call callback| WF5
+    WH -->|schedule post| WF4
+    CR -->|18:00 daily| WF2
+
+    WF1 --> PG
+    WF1 --> WAout
+    WF2 --> PG
+    WF2 --> WAout
+    WF3 --> R2
+    WF3 --> PG
+    WF3 --> WAout
+    WF4 --> IG
+    WF4 --> FB
+    WF4 --> LI
+    WF4 --> PG
+    WF5 --> WAout
+    WF5 --> PG
+    WF5 --> BE
+
+    BE -->|POST schedule-post| WF4
+    PG --> BE
 ```
 
 ---
@@ -113,7 +146,7 @@ n8n-business-automation/
 | [WORKFLOWS.md](docs/WORKFLOWS.md) | Trigger, steps, and outcome for every workflow |
 | [SETUP.md](docs/SETUP.md) | Self-host n8n with Docker, configure all credentials |
 | [INTEGRATION.md](docs/INTEGRATION.md) | Connect workflows to a Node.js backend |
-| [DATA_FLOW.md](docs/DATA_FLOW.md) | Visual ASCII data-flow diagrams |
+| [DATA_FLOW.md](docs/DATA_FLOW.md) | Mermaid data-flow diagrams for every workflow |
 
 ---
 
